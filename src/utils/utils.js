@@ -114,10 +114,44 @@ function handleToolCall(message, antigravityMessages){
     });
   }
 }
+/**
+ * 转换 OpenAI 消息格式为 Antigravity/Gemini 格式
+ * 按照文档思路：
+ * 1. 提取开头的连续 system 消息作为 system_instruction
+ * 2. 非开头的 system 消息转换为 user 角色
+ * 
+ * @param {Array} openaiMessages - OpenAI 格式的消息数组
+ * @returns {Object} { contents: Array, systemInstruction: Object|null }
+ */
 function openaiMessageToAntigravity(openaiMessages){
   const antigravityMessages = [];
-  for (const message of openaiMessages) {
+  const systemInstructionParts = [];
+  let systemInstructionEndIndex = -1;
+  
+  // 第一步：提取开头的连续 system 消息
+  // 必须是消息列表开头的 system 角色且内容为字符串类型
+  for (let i = 0; i < openaiMessages.length; i++) {
+    const message = openaiMessages[i];
+    if (message.role === 'system' && typeof message.content === 'string') {
+      systemInstructionParts.push(message.content);
+      systemInstructionEndIndex = i;
+    } else {
+      // 遇到第一个非 system 或内容非字符串的消息就停止
+      break;
+    }
+  }
+  
+  // 将收集到的系统指令合并为一个字符串
+  const systemInstructionText = systemInstructionParts.join('\n');
+  const systemInstruction = systemInstructionText 
+    ? { role: "user", parts: [{ text: systemInstructionText }] }
+    : null;
+  
+  // 第二步：处理剩余的消息（跳过已提取的 system 消息）
+  for (let i = systemInstructionEndIndex + 1; i < openaiMessages.length; i++) {
+    const message = openaiMessages[i];
     if (message.role === "user" || message.role === "system") {
+      // 非开头的 system 消息转换为 user 角色
       const extracted = extractImagesFromContent(message.content);
       handleUserMessage(extracted, antigravityMessages);
     } else if (message.role === "assistant") {
@@ -127,7 +161,10 @@ function openaiMessageToAntigravity(openaiMessages){
     }
   }
   
-  return antigravityMessages;
+  return {
+    contents: antigravityMessages,
+    systemInstruction: systemInstruction
+  };
 }
 function generateGenerationConfig(parameters, enableThinking, actualModelName){
   const generationConfig = {
@@ -181,24 +218,31 @@ async function generateRequestBody(openaiMessages,modelName,parameters,openaiToo
     modelName === "gpt-oss-120b-medium"
   const actualModelName = modelName.endsWith('-thinking') ? modelName.slice(0, -9) : modelName;
   
+  // 转换消息格式，提取 system_instruction
+  const { contents, systemInstruction } = openaiMessageToAntigravity(openaiMessages);
+  
+  // 构建请求体
+  const requestData = {
+    contents: contents,
+    tools: convertOpenAIToolsToAntigravity(openaiTools),
+    toolConfig: {
+      functionCallingConfig: {
+        mode: "VALIDATED"
+      }
+    },
+    generationConfig: generateGenerationConfig(parameters, enableThinking, actualModelName),
+    sessionId: token.sessionId
+  };
+  
+  // 只有当存在 systemInstruction 时才添加（废除 config 中的固定系统提示词）
+  if (systemInstruction) {
+    requestData.systemInstruction = systemInstruction;
+  }
+  
   return{
     project: token.projectId,
     requestId: generateRequestId(),
-    request: {
-      contents: openaiMessageToAntigravity(openaiMessages),
-      systemInstruction: {
-        role: "user",
-        parts: [{ text: config.systemInstruction }]
-      },
-      tools: convertOpenAIToolsToAntigravity(openaiTools),
-      toolConfig: {
-        functionCallingConfig: {
-          mode: "VALIDATED"
-        }
-      },
-      generationConfig: generateGenerationConfig(parameters, enableThinking, actualModelName),
-      sessionId: token.sessionId
-    },
+    request: requestData,
     model: actualModelName,
     userAgent: "antigravity"
   }
