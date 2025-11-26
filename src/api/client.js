@@ -23,26 +23,109 @@ function convertFinishReason(geminiFinishReason) {
   return mapping[geminiFinishReason] || 'stop';
 }
 
-/**
- * 估算 token 数量（简单估算：中文约 1.5 字符/token，英文约 4 字符/token）
- */
 function estimateTokens(text) {
   if (!text) return 0;
-  // 简单估算：混合中英文
   const chineseChars = (text.match(/[\u4e00-\u9fa5]/g) || []).length;
   const otherChars = text.length - chineseChars;
   return Math.ceil(chineseChars / 1.5 + otherChars / 4);
 }
 
-export async function generateAssistantResponse(requestBody, callback) {
+function processResponseData(responseData, callback, state) {
+  const candidate = responseData.candidates?.[0];
+  const parts = candidate?.content?.parts;
+  
+  if (candidate?.finishReason && !state.finishReason) {
+    state.finishReason = convertFinishReason(candidate.finishReason);
+  }
+  
+  if (responseData.usageMetadata) {
+    if (responseData.usageMetadata.promptTokenCount) {
+      state.promptTokens = responseData.usageMetadata.promptTokenCount;
+    }
+    if (responseData.usageMetadata.candidatesTokenCount) {
+      state.completionTokens = responseData.usageMetadata.candidatesTokenCount;
+    }
+  }
+  
+  if (parts) {
+    for (const part of parts) {
+      if (part.thought === true) {
+        if (!state.thinkingStarted) {
+          callback({ type: 'thinking', content: '<think>\n' });
+          state.thinkingStarted = true;
+        }
+        callback({ type: 'thinking', content: part.text || '' });
+      } else if (part.text !== undefined) {
+        if (state.thinkingStarted) {
+          callback({ type: 'thinking', content: '\n</think>\n' });
+          state.thinkingStarted = false;
+        }
+        state.fullContent += part.text;
+        callback({ type: 'text', content: part.text });
+      } else if (part.functionCall) {
+        state.toolCalls.push({
+          id: part.functionCall.id || generateToolCallId(),
+          type: 'function',
+          function: {
+            name: part.functionCall.name,
+            arguments: JSON.stringify(part.functionCall.args)
+          }
+        });
+      }
+    }
+  }
+  
+  if (candidate?.finishReason && state.toolCalls.length > 0) {
+    if (state.thinkingStarted) {
+      callback({ type: 'thinking', content: '\n</think>\n' });
+      state.thinkingStarted = false;
+    }
+    callback({ type: 'tool_calls', tool_calls: state.toolCalls });
+    state.toolCalls = [];
+  }
+}
+
+async function processStreamingResponse(response, callback, state) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    
+    const chunk = decoder.decode(value);
+    const lines = chunk.split('\n').filter(line => line.startsWith('data: '));
+    
+    for (const line of lines) {
+      const jsonStr = line.slice(6);
+      if (!jsonStr || jsonStr.trim() === '') continue;
+      try {
+        const data = JSON.parse(jsonStr);
+        if (data.response) {
+          processResponseData(data.response, callback, state);
+        }
+      } catch (e) {
+        // 忽略解析错误
+      }
+    }
+  }
+}
+
+async function processNonStreamingResponse(response, callback, state) {
+  const data = await response.json();
+  const responseData = data.response || data;
+  processResponseData(responseData, callback, state);
+}
+
+export async function generateAssistantResponse(requestBody, stream, callback) {
   const token = await tokenManager.getToken();
   
   if (!token) {
     throw new Error('没有可用的token，请运行 npm run login 获取token');
   }
-  
-  const url = config.api.url;
-  
+
+  const url = stream ? config.api.url : config.api.nonStreamUrl;
+
   const response = await fetch(url, {
     method: 'POST',
     headers: {
@@ -64,112 +147,42 @@ export async function generateAssistantResponse(requestBody, callback) {
     throw new Error(`API请求失败 (${response.status}): ${errorText}`);
   }
 
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let thinkingStarted = false;
-  let toolCalls = [];
-  let finishReason = null;
-  let promptTokens = 0;
-  let completionTokens = 0;
-  let fullContent = '';
+  const state = {
+    thinkingStarted: false,
+    toolCalls: [],
+    finishReason: null,
+    promptTokens: 0,
+    completionTokens: 0,
+    fullContent: ''
+  };
 
-  // 估算 prompt tokens（基于请求体）
   try {
     const requestText = JSON.stringify(requestBody);
-    promptTokens = estimateTokens(requestText);
+    state.promptTokens = estimateTokens(requestText);
   } catch (e) {
     // 忽略错误
   }
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    
-    const chunk = decoder.decode(value);
-    const lines = chunk.split('\n').filter(line => line.startsWith('data: '));
-    
-    for (const line of lines) {
-      const jsonStr = line.slice(6);
-      try {
-        const data = JSON.parse(jsonStr);
-        const candidate = data.response?.candidates?.[0];
-        const parts = candidate?.content?.parts;
-        
-        // 提取 finishReason
-        if (candidate?.finishReason && !finishReason) {
-          finishReason = convertFinishReason(candidate.finishReason);
-        }
-        
-        // 提取 token 使用信息（如果可用）
-        if (data.response?.usageMetadata) {
-          if (data.response.usageMetadata.promptTokenCount) {
-            promptTokens = data.response.usageMetadata.promptTokenCount;
-          }
-          if (data.response.usageMetadata.candidatesTokenCount) {
-            completionTokens = data.response.usageMetadata.candidatesTokenCount;
-          }
-        }
-        
-        if (parts) {
-          for (const part of parts) {
-            if (part.thought === true) {
-              if (!thinkingStarted) {
-                callback({ type: 'thinking', content: '<think>\n' });
-                thinkingStarted = true;
-              }
-              callback({ type: 'thinking', content: part.text || '' });
-            } else if (part.text !== undefined) {
-              if (thinkingStarted) {
-                callback({ type: 'thinking', content: '\n</think>\n' });
-                thinkingStarted = false;
-              }
-              fullContent += part.text;
-              callback({ type: 'text', content: part.text });
-            } else if (part.functionCall) {
-              toolCalls.push({
-                id: part.functionCall.id || generateToolCallId(),
-                type: 'function',
-                function: {
-                  name: part.functionCall.name,
-                  arguments: JSON.stringify(part.functionCall.args)
-                }
-              });
-            }
-          }
-        }
-        
-        // 当遇到 finishReason 时，发送所有收集的工具调用
-        if (candidate?.finishReason && toolCalls.length > 0) {
-          if (thinkingStarted) {
-            callback({ type: 'thinking', content: '\n</think>\n' });
-            thinkingStarted = false;
-          }
-          callback({ type: 'tool_calls', tool_calls: toolCalls });
-          toolCalls = [];
-        }
-      } catch (e) {
-        // 忽略解析错误
-      }
-    }
+  if (stream) {
+    await processStreamingResponse(response, callback, state);
+  } else {
+    await processNonStreamingResponse(response, callback, state);
   }
 
-  // 如果没有从响应中获取到 finishReason，使用默认值
-  if (!finishReason) {
-    finishReason = toolCalls.length > 0 ? 'tool_calls' : 'stop';
+  if (!state.finishReason) {
+    state.finishReason = state.toolCalls.length > 0 ? 'tool_calls' : 'stop';
   }
 
-  // 如果没有从响应中获取到 completion tokens，进行估算
-  if (completionTokens === 0 && fullContent) {
-    completionTokens = estimateTokens(fullContent);
+  if (state.completionTokens === 0 && state.fullContent) {
+    state.completionTokens = estimateTokens(state.fullContent);
   }
 
-  // 返回元数据
   return {
-    finish_reason: finishReason,
+    finish_reason: state.finishReason,
     usage: {
-      prompt_tokens: promptTokens,
-      completion_tokens: completionTokens,
-      total_tokens: promptTokens + completionTokens
+      prompt_tokens: state.promptTokens,
+      completion_tokens: state.completionTokens,
+      total_tokens: state.promptTokens + state.completionTokens
     }
   };
 }

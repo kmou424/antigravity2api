@@ -70,7 +70,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       let finalFinishReason = 'stop';
       let usage = null;
       
-      const metadata = await generateAssistantResponse(requestBody, (data) => {
+      const metadata = await generateAssistantResponse(requestBody, stream, (data) => {
         if (data.type === 'tool_calls') {
           hasToolCall = true;
           res.write(`data: ${JSON.stringify({
@@ -140,7 +140,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       let toolCalls = [];
       let thinkingContent = '';
       
-      const metadata = await generateAssistantResponse(requestBody, (data) => {
+      const metadata = await generateAssistantResponse(requestBody, stream, (data) => {
         if (data.type === 'tool_calls') {
           toolCalls = data.tool_calls;
         } else if (data.type === 'thinking') {

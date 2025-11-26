@@ -5,6 +5,7 @@
   },
   "api": {
     "url": "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:streamGenerateContent?alt=sse",
+    "nonStreamUrl": "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:generateContent?alt=json",
     "modelsUrl": "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:fetchAvailableModels",
     "host": "daily-cloudcode-pa.sandbox.googleapis.com",
     "userAgent": "antigravity/1.11.3 windows/amd64"
